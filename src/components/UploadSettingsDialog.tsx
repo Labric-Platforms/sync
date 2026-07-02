@@ -22,6 +22,7 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { toast } from "sonner";
+import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
 import { useUploadManager } from "@/hooks/useUploadManager";
 
 interface UploadSettingsSheetProps {
@@ -40,6 +41,7 @@ function UploadSettingsSheet({ children }: UploadSettingsSheetProps) {
   const [concurrencyInput, setConcurrencyInput] = useState("");
   const [ignoredPatterns, setIgnoredPatterns] = useState<string[]>([]);
   const [newPattern, setNewPattern] = useState("");
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
 
   const resetDraft = useCallback(() => {
     if (config) {
@@ -57,6 +59,9 @@ function UploadSettingsSheet({ children }: UploadSettingsSheetProps) {
       resetDraft();
       setDelayError("");
       setConcurrencyError("");
+      isAutostartEnabled()
+        .then(setLaunchAtLogin)
+        .catch((err) => console.error("Failed to read autostart state:", err));
     }
   }, [open, resetDraft]);
 
@@ -107,6 +112,11 @@ function UploadSettingsSheet({ children }: UploadSettingsSheetProps) {
         max_concurrent_uploads: concurrency,
         ignored_patterns: ignoredPatterns,
       });
+      if (launchAtLogin) {
+        await enableAutostart();
+      } else {
+        await disableAutostart();
+      }
       toast.success("Settings saved");
       setOpen(false);
     } catch (err) {
@@ -172,6 +182,18 @@ function UploadSettingsSheet({ children }: UploadSettingsSheetProps) {
                 id="ignore-existing"
                 checked={ignoreExisting}
                 onCheckedChange={setIgnoreExisting}
+              />
+            </Field>
+
+            <Field orientation="horizontal" className="!items-center justify-between gap-4">
+              <FieldContent>
+                <FieldLabel htmlFor="launch-at-login">Launch at Login</FieldLabel>
+                <FieldDescription>Start Labric Sync when you log in.</FieldDescription>
+              </FieldContent>
+              <Switch
+                id="launch-at-login"
+                checked={launchAtLogin}
+                onCheckedChange={setLaunchAtLogin}
               />
             </Field>
 

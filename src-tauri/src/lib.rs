@@ -431,6 +431,10 @@ pub fn run() {
     let heartbeat_task_state: HeartbeatTaskState = Arc::new(tokio::sync::Mutex::new(None));
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_http::init())

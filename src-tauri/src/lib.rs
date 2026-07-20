@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use sysinfo::{CpuRefreshKind, System};
 use tauri::menu::{Menu, MenuItem};
@@ -79,8 +79,17 @@ struct DeviceInfo {
 type WatcherState = Arc<Mutex<Option<RecommendedWatcher>>>;
 // Folder currently being watched, if any
 type WatchedFolderState = Arc<Mutex<Option<String>>>;
+// Bumped by every start/stop request so an in-flight start (whose initial scan
+// can take a long time on big folders) can detect it was superseded and abort
+// instead of undoing a newer stop or folder change
+type WatchGeneration = Arc<AtomicU64>;
 
 const WATCHED_FOLDER_STORE_KEY: &str = "watched_folder";
+
+enum WatchStartOutcome {
+    Started,
+    Superseded,
+}
 
 #[tauri::command]
 async fn start_watching(
@@ -90,17 +99,25 @@ async fn start_watching(
     upload_queue: tauri::State<'_, UploadQueue>,
     upload_config: tauri::State<'_, UploadConfigState>,
     watched_folder: tauri::State<'_, WatchedFolderState>,
+    generation: tauri::State<'_, WatchGeneration>,
 ) -> Result<String, String> {
-    start_watching_impl(
-        folder_path,
+    let expected_generation = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    match start_watching_impl(
+        folder_path.clone(),
         &app_handle,
         watcher_state.inner(),
         upload_queue.inner(),
         upload_config.inner(),
         watched_folder.inner(),
-    )
+        generation.inner(),
+        expected_generation,
+    )? {
+        WatchStartOutcome::Started => Ok(format!("Started watching: {folder_path}")),
+        WatchStartOutcome::Superseded => Ok("Watch superseded by a newer request".to_string()),
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_watching_impl(
     folder_path: String,
     app_handle: &AppHandle,
@@ -108,7 +125,9 @@ fn start_watching_impl(
     upload_queue: &UploadQueue,
     upload_config: &UploadConfigState,
     watched_folder: &WatchedFolderState,
-) -> Result<String, String> {
+    generation: &WatchGeneration,
+    expected_generation: u64,
+) -> Result<WatchStartOutcome, String> {
     // Stop any existing watcher
     {
         let mut watcher = watcher_state.lock();
@@ -184,20 +203,25 @@ fn start_watching_impl(
         .watch(Path::new(&folder_path), RecursiveMode::Recursive)
         .map_err(|e| format!("Failed to watch folder: {e}"))?;
 
-    // Store the watcher
+    // Install the watcher, record the watched folder in memory, and persist it
+    // so watching resumes automatically on the next launch (e.g. autostart
+    // after a reboot). All three happen under the watcher lock, after checking
+    // that no newer start/stop request arrived while the initial scan ran —
+    // otherwise a slow scan would silently undo the user's later action.
     {
-        let mut watcher_state = watcher_state.lock();
-        *watcher_state = Some(watcher);
+        let mut watcher_guard = watcher_state.lock();
+        if generation.load(Ordering::SeqCst) != expected_generation {
+            log::info!("Watch start for {folder_path} was superseded before it finished; discarding");
+            return Ok(WatchStartOutcome::Superseded);
+        }
+        *watcher_guard = Some(watcher);
+        *watched_folder.lock() = Some(folder_path.clone());
+        if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
+            store.set(WATCHED_FOLDER_STORE_KEY, serde_json::json!(folder_path));
+        }
     }
 
-    // Record the watched folder in memory and persist it so watching resumes
-    // automatically on the next launch (e.g. autostart after a reboot)
-    *watched_folder.lock() = Some(folder_path.clone());
-    if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
-        store.set(WATCHED_FOLDER_STORE_KEY, serde_json::json!(folder_path));
-    }
-
-    Ok(format!("Started watching: {folder_path}"))
+    Ok(WatchStartOutcome::Started)
 }
 
 fn capture_initial_contents(
@@ -248,8 +272,12 @@ fn capture_initial_contents(
 async fn stop_watching(
     watcher_state: tauri::State<'_, WatcherState>,
     watched_folder: tauri::State<'_, WatchedFolderState>,
+    generation: tauri::State<'_, WatchGeneration>,
     app_handle: AppHandle,
 ) -> Result<String, String> {
+    // Invalidate any in-flight start before clearing, so a start that is still
+    // scanning cannot re-install itself after this stop completes
+    generation.fetch_add(1, Ordering::SeqCst);
     {
         let mut watcher = watcher_state.lock();
         *watcher = None;
@@ -458,6 +486,7 @@ struct QuitFlag(AtomicBool);
 pub fn run() {
     let watcher_state: WatcherState = Arc::new(Mutex::new(None));
     let watched_folder_state: WatchedFolderState = Arc::new(Mutex::new(None));
+    let watch_generation: WatchGeneration = Arc::new(AtomicU64::new(0));
     let upload_queue: UploadQueue = Arc::new(Mutex::new(VecDeque::new()));
     let upload_config: UploadConfigState = Arc::new(Mutex::new(UploadConfig::default()));
     let upload_progress: UploadProgressState = Arc::new(Mutex::new(UploadProgress {
@@ -507,6 +536,7 @@ pub fn run() {
         .manage(QuitFlag(AtomicBool::new(false)))
         .manage(watcher_state.clone())
         .manage(watched_folder_state.clone())
+        .manage(watch_generation.clone())
         .manage(http_client.clone())
         .manage(upload_queue.clone())
         .manage(upload_config.clone())
@@ -590,6 +620,9 @@ pub fn run() {
                     let watched_folder_state = watched_folder_state.clone();
                     let upload_queue = upload_queue.clone();
                     let upload_config = upload_config.clone();
+                    let generation = watch_generation.clone();
+                    let expected_generation =
+                        watch_generation.fetch_add(1, Ordering::SeqCst) + 1;
                     tauri::async_runtime::spawn_blocking(move || {
                         match start_watching_impl(
                             folder.clone(),
@@ -598,15 +631,26 @@ pub fn run() {
                             &upload_queue,
                             &upload_config,
                             &watched_folder_state,
+                            &generation,
+                            expected_generation,
                         ) {
-                            Ok(_) => {
+                            Ok(WatchStartOutcome::Started) => {
                                 log::info!("Resumed watching {folder} after restart");
                                 let _ = app_handle.emit("watch_resumed", &folder);
                             }
+                            Ok(WatchStartOutcome::Superseded) => {
+                                log::info!(
+                                    "Resume of {folder} superseded by a user start/stop request"
+                                );
+                            }
                             Err(e) => {
                                 log::error!("Failed to resume watching {folder}: {e}");
-                                *watched_folder_state.lock() = None;
-                                let _ = app_handle.emit("watch_resume_failed", &folder);
+                                // Only roll back if no newer start/stop request
+                                // owns the watch state by now
+                                if generation.load(Ordering::SeqCst) == expected_generation {
+                                    *watched_folder_state.lock() = None;
+                                    let _ = app_handle.emit("watch_resume_failed", &folder);
+                                }
                             }
                         }
                     });

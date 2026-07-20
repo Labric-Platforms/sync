@@ -191,6 +191,10 @@ export default function Simple() {
     const unlistenWatchResumed = listen("watch_resumed", (event) => {
       setSelectedFolder(event.payload as string);
     });
+    const unlistenWatchResumeFailed = listen("watch_resume_failed", (event) => {
+      setSelectedFolder("");
+      toast.error(`Could not resume watching ${event.payload as string}`);
+    });
     invoke<string | null>("get_watched_folder")
       .then((folder) => {
         if (folder) setSelectedFolder(folder);
@@ -218,6 +222,7 @@ export default function Simple() {
       unlistenHeartbeat.then((fn) => fn());
       unlistenUploadStatus.then((fn) => fn());
       unlistenWatchResumed.then((fn) => fn());
+      unlistenWatchResumeFailed.then((fn) => fn());
     };
   }, []);
 

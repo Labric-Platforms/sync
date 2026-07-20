@@ -869,10 +869,10 @@ pub fn set_upload_config(
     *upload_config.lock() = config.clone();
 
     if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
-        store.set(
-            UPLOAD_CONFIG_STORE_KEY,
-            serde_json::to_value(&config).unwrap_or_default(),
-        );
+        match serde_json::to_value(&config) {
+            Ok(value) => store.set(UPLOAD_CONFIG_STORE_KEY, value),
+            Err(e) => log::error!("Failed to serialize upload config for persistence: {e}"),
+        }
     }
 
     Ok("Upload configuration updated".to_string())

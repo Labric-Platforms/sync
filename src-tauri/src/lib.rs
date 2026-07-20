@@ -606,6 +606,7 @@ pub fn run() {
                             Err(e) => {
                                 log::error!("Failed to resume watching {folder}: {e}");
                                 *watched_folder_state.lock() = None;
+                                let _ = app_handle.emit("watch_resume_failed", &folder);
                             }
                         }
                     });

@@ -43,7 +43,11 @@ pub const SETTINGS_STORE_FILENAME: &str = "settings.json";
 
 // ── Data types ──────────────────────────────────────────────────────────
 
+// serde(default) keeps a stored config readable when future versions add
+// fields: missing fields fall back to Default instead of failing the whole
+// deserialization and discarding the user's settings
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UploadConfig {
     pub enabled: bool,
     pub server_url: String,

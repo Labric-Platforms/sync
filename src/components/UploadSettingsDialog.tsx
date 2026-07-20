@@ -112,10 +112,15 @@ function UploadSettingsSheet({ children }: UploadSettingsSheetProps) {
         max_concurrent_uploads: concurrency,
         ignored_patterns: ignoredPatterns,
       });
-      if (launchAtLogin) {
-        await enableAutostart();
-      } else {
-        await disableAutostart();
+      try {
+        if (launchAtLogin) {
+          await enableAutostart();
+        } else {
+          await disableAutostart();
+        }
+      } catch (err) {
+        console.error("Failed to toggle autostart:", err);
+        toast.error("Failed to update launch-at-login setting");
       }
       toast.success("Settings saved");
       setOpen(false);

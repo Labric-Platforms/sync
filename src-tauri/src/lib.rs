@@ -36,12 +36,14 @@ fn show_main_window(window: &WebviewWindow) {
 }
 
 mod upload;
+use tauri_plugin_store::StoreExt;
 use upload::{
     add_to_upload_queue_sync, add_to_upload_queue_with_event_type, clear_session_context,
     clear_upload_queue, get_org_members, get_queue_size, get_session_context, get_upload_config,
-    get_upload_progress, process_upload_queue, restore_session_context, set_session_context,
-    set_upload_config, trigger_manual_upload, SessionContext, SessionContextState, UploadConfig,
-    UploadConfigState, UploadProgress, UploadProgressState, UploadQueue,
+    get_upload_progress, process_upload_queue, restore_session_context, restore_upload_config,
+    set_session_context, set_upload_config, trigger_manual_upload, SessionContext,
+    SessionContextState, UploadConfig, UploadConfigState, UploadProgress, UploadProgressState,
+    UploadQueue, SETTINGS_STORE_FILENAME,
 };
 
 mod heartbeat;
@@ -75,6 +77,10 @@ struct DeviceInfo {
 
 // Global watcher state
 type WatcherState = Arc<Mutex<Option<RecommendedWatcher>>>;
+// Folder currently being watched, if any
+type WatchedFolderState = Arc<Mutex<Option<String>>>;
+
+const WATCHED_FOLDER_STORE_KEY: &str = "watched_folder";
 
 #[tauri::command]
 async fn start_watching(
@@ -83,6 +89,25 @@ async fn start_watching(
     watcher_state: tauri::State<'_, WatcherState>,
     upload_queue: tauri::State<'_, UploadQueue>,
     upload_config: tauri::State<'_, UploadConfigState>,
+    watched_folder: tauri::State<'_, WatchedFolderState>,
+) -> Result<String, String> {
+    start_watching_impl(
+        folder_path,
+        &app_handle,
+        watcher_state.inner(),
+        upload_queue.inner(),
+        upload_config.inner(),
+        watched_folder.inner(),
+    )
+}
+
+fn start_watching_impl(
+    folder_path: String,
+    app_handle: &AppHandle,
+    watcher_state: &WatcherState,
+    upload_queue: &UploadQueue,
+    upload_config: &UploadConfigState,
+    watched_folder: &WatchedFolderState,
 ) -> Result<String, String> {
     // Stop any existing watcher
     {
@@ -91,16 +116,11 @@ async fn start_watching(
     }
 
     // First, capture initial folder contents and optionally queue for upload
-    capture_initial_contents(
-        &folder_path,
-        &app_handle,
-        upload_queue.inner(),
-        upload_config.inner(),
-    )?;
+    capture_initial_contents(&folder_path, app_handle, upload_queue, upload_config)?;
 
     let app_handle_clone = app_handle.clone();
-    let upload_queue_clone = upload_queue.inner().clone();
-    let upload_config_clone = upload_config.inner().clone();
+    let upload_queue_clone = upload_queue.clone();
+    let upload_config_clone = upload_config.clone();
     let folder_path_clone = folder_path.clone();
 
     // Channel to move work off the watcher callback thread so it never blocks
@@ -170,6 +190,13 @@ async fn start_watching(
         *watcher_state = Some(watcher);
     }
 
+    // Record the watched folder in memory and persist it so watching resumes
+    // automatically on the next launch (e.g. autostart after a reboot)
+    *watched_folder.lock() = Some(folder_path.clone());
+    if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
+        store.set(WATCHED_FOLDER_STORE_KEY, serde_json::json!(folder_path));
+    }
+
     Ok(format!("Started watching: {folder_path}"))
 }
 
@@ -218,10 +245,30 @@ fn capture_initial_contents(
 }
 
 #[tauri::command]
-async fn stop_watching(watcher_state: tauri::State<'_, WatcherState>) -> Result<String, String> {
-    let mut watcher = watcher_state.lock();
-    *watcher = None;
+async fn stop_watching(
+    watcher_state: tauri::State<'_, WatcherState>,
+    watched_folder: tauri::State<'_, WatchedFolderState>,
+    app_handle: AppHandle,
+) -> Result<String, String> {
+    {
+        let mut watcher = watcher_state.lock();
+        *watcher = None;
+    }
+    *watched_folder.lock() = None;
+
+    // The user explicitly stopped watching, so don't resume on next launch
+    if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
+        let _ = store.delete(WATCHED_FOLDER_STORE_KEY);
+    }
+
     Ok("Stopped watching".to_string())
+}
+
+#[tauri::command]
+fn get_watched_folder(
+    watched_folder: tauri::State<'_, WatchedFolderState>,
+) -> Result<Option<String>, String> {
+    Ok(watched_folder.lock().clone())
 }
 
 fn get_device_id_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -410,6 +457,7 @@ struct QuitFlag(AtomicBool);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let watcher_state: WatcherState = Arc::new(Mutex::new(None));
+    let watched_folder_state: WatchedFolderState = Arc::new(Mutex::new(None));
     let upload_queue: UploadQueue = Arc::new(Mutex::new(VecDeque::new()));
     let upload_config: UploadConfigState = Arc::new(Mutex::new(UploadConfig::default()));
     let upload_progress: UploadProgressState = Arc::new(Mutex::new(UploadProgress {
@@ -430,7 +478,20 @@ pub fn run() {
         }));
     let heartbeat_task_state: HeartbeatTaskState = Arc::new(tokio::sync::Mutex::new(None));
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // A second launch (e.g. clicking the shortcut while the autostarted
+    // instance is running) focuses the existing window instead of spawning a
+    // duplicate watcher/uploader. Release-only so `pnpm tauri dev` can still
+    // run alongside the installed app.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            show_main_window(&window);
+        }
+    }));
+
+    let app = builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -444,7 +505,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(QuitFlag(AtomicBool::new(false)))
-        .manage(watcher_state)
+        .manage(watcher_state.clone())
+        .manage(watched_folder_state.clone())
         .manage(http_client.clone())
         .manage(upload_queue.clone())
         .manage(upload_config.clone())
@@ -456,6 +518,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_watching,
             stop_watching,
+            get_watched_folder,
             get_device_info,
             get_upload_config,
             set_upload_config,
@@ -478,6 +541,12 @@ pub fn run() {
             let restored_ctx = restore_session_context(app.handle());
             *session_context.lock() = restored_ctx;
 
+            // Restore persisted upload config (ignored patterns, delays, etc.)
+            // so headless resume below runs with the user's saved settings
+            if let Some(cfg) = restore_upload_config(app.handle()) {
+                *upload_config.lock() = cfg;
+            }
+
             // Start the upload processor in the background
             let upload_queue_clone = upload_queue.clone();
             let upload_config_clone = upload_config.clone();
@@ -497,6 +566,55 @@ pub fn run() {
                 )
                 .await;
             });
+
+            // Resume watching the folder that was being watched when the app
+            // last ran (e.g. autostart after a reboot), so sync continues
+            // without user interaction. The initial scan re-checks every file
+            // against the server, which also picks up changes made while the
+            // app was not running.
+            let persisted_folder = app
+                .handle()
+                .store(SETTINGS_STORE_FILENAME)
+                .ok()
+                .and_then(|s| s.get(WATCHED_FOLDER_STORE_KEY))
+                .and_then(|v| v.as_str().map(String::from));
+
+            if let Some(folder) = persisted_folder {
+                if Path::new(&folder).is_dir() {
+                    // Publish the folder before the scan finishes so the
+                    // frontend sees it as watched as soon as the webview loads
+                    *watched_folder_state.lock() = Some(folder.clone());
+
+                    let app_handle = app.handle().clone();
+                    let watcher_state = watcher_state.clone();
+                    let watched_folder_state = watched_folder_state.clone();
+                    let upload_queue = upload_queue.clone();
+                    let upload_config = upload_config.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        match start_watching_impl(
+                            folder.clone(),
+                            &app_handle,
+                            &watcher_state,
+                            &upload_queue,
+                            &upload_config,
+                            &watched_folder_state,
+                        ) {
+                            Ok(_) => {
+                                log::info!("Resumed watching {folder} after restart");
+                                let _ = app_handle.emit("watch_resumed", &folder);
+                            }
+                            Err(e) => {
+                                log::error!("Failed to resume watching {folder}: {e}");
+                                *watched_folder_state.lock() = None;
+                            }
+                        }
+                    });
+                } else {
+                    // Keep the stored path so a temporarily unavailable folder
+                    // (e.g. an unmounted drive) is retried on the next launch
+                    log::warn!("Not resuming watch: folder does not exist: {folder}");
+                }
+            }
 
             // Build system tray
             let show_i = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;

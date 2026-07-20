@@ -186,6 +186,17 @@ export default function Simple() {
       setHeartbeatStatus(event.payload);
     });
 
+    // The backend resumes watching on its own after a restart; reflect that
+    // in the UI whether it finished before or after this component mounted
+    const unlistenWatchResumed = listen("watch_resumed", (event) => {
+      setSelectedFolder(event.payload as string);
+    });
+    invoke<string | null>("get_watched_folder")
+      .then((folder) => {
+        if (folder) setSelectedFolder(folder);
+      })
+      .catch((err) => console.error("Failed to get watched folder:", err));
+
     // Listen for file upload status events
     const unlistenUploadStatus = listen("file_upload_status", (event) => {
       console.log("file_upload_status", event);
@@ -206,6 +217,7 @@ export default function Simple() {
       unlistenFileChange.then((fn) => fn());
       unlistenHeartbeat.then((fn) => fn());
       unlistenUploadStatus.then((fn) => fn());
+      unlistenWatchResumed.then((fn) => fn());
     };
   }, []);
 

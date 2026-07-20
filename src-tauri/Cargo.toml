@@ -1,6 +1,6 @@
 [package]
 name = "labric-sync"
-version = "0.1.13"
+version = "0.1.14"
 description = "Labric Sync desktop app"
 authors = ["Labric"]
 edition = "2021"
@@ -48,4 +48,8 @@ futures = "0.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
 

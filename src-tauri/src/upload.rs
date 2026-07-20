@@ -890,7 +890,13 @@ const UPLOAD_CONFIG_STORE_KEY: &str = "upload_config";
 pub fn restore_upload_config(app_handle: &AppHandle) -> Option<UploadConfig> {
     let store = app_handle.store(SETTINGS_STORE_FILENAME).ok()?;
     let value = store.get(UPLOAD_CONFIG_STORE_KEY)?;
-    let mut config: UploadConfig = serde_json::from_value(value.clone()).ok()?;
+    let mut config: UploadConfig = match serde_json::from_value(value.clone()) {
+        Ok(config) => config,
+        Err(e) => {
+            log::warn!("Failed to restore upload config, using defaults: {e}");
+            return None;
+        }
+    };
     config.server_url = UploadConfig::default().server_url;
     Some(config)
 }

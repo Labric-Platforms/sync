@@ -39,11 +39,15 @@ const STATUS_UPLOADED: &str = "uploaded";
 const STATUS_FAILED: &str = "failed";
 
 // Store filename constant
-const SETTINGS_STORE_FILENAME: &str = "settings.json";
+pub const SETTINGS_STORE_FILENAME: &str = "settings.json";
 
 // ── Data types ──────────────────────────────────────────────────────────
 
+// serde(default) keeps a stored config readable when future versions add
+// fields: missing fields fall back to Default instead of failing the whole
+// deserialization and discarding the user's settings
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UploadConfig {
     pub enabled: bool,
     pub server_url: String,
@@ -864,9 +868,37 @@ pub fn get_upload_config(
 pub fn set_upload_config(
     config: UploadConfig,
     upload_config: tauri::State<'_, UploadConfigState>,
+    app_handle: AppHandle,
 ) -> Result<String, String> {
-    *upload_config.lock() = config;
+    *upload_config.lock() = config.clone();
+
+    if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
+        match serde_json::to_value(&config) {
+            Ok(value) => store.set(UPLOAD_CONFIG_STORE_KEY, value),
+            Err(e) => log::error!("Failed to serialize upload config for persistence: {e}"),
+        }
+    }
+
     Ok("Upload configuration updated".to_string())
+}
+
+const UPLOAD_CONFIG_STORE_KEY: &str = "upload_config";
+
+/// Restore the upload config from the Tauri Store on startup. The server URL
+/// always comes from the build environment, not the store, so a config saved
+/// by a dev build can never point a production build at localhost.
+pub fn restore_upload_config(app_handle: &AppHandle) -> Option<UploadConfig> {
+    let store = app_handle.store(SETTINGS_STORE_FILENAME).ok()?;
+    let value = store.get(UPLOAD_CONFIG_STORE_KEY)?;
+    let mut config: UploadConfig = match serde_json::from_value(value.clone()) {
+        Ok(config) => config,
+        Err(e) => {
+            log::warn!("Failed to restore upload config, using defaults: {e}");
+            return None;
+        }
+    };
+    config.server_url = UploadConfig::default().server_url;
+    Some(config)
 }
 
 #[tauri::command]

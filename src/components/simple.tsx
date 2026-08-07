@@ -201,46 +201,6 @@ export default function Simple() {
       })
       .catch((err) => console.error("Failed to get watched folder:", err));
 
-    // Events emitted before this component mounted (e.g. the initial scan of
-    // a watch resumed at startup) were dropped, so backfill from the backend's
-    // backlog. The listeners above are already registered, so anything newer
-    // than these snapshots still arrives live; on conflicts the live entry wins.
-    invoke<FileChangeEvent[]>("get_file_change_backlog")
-      .then((backlog) => {
-        if (backlog.length === 0) return;
-        setFileChanges((prev) => {
-          const seen = new Set(prev.map((change) => change.path));
-          const merged = [
-            ...prev,
-            ...backlog.filter((change) => !seen.has(change.path)),
-          ];
-          return merged.slice(0, 500);
-        });
-      })
-      .catch((err) =>
-        console.error("Failed to load file change backlog:", err)
-      );
-    invoke<FileUploadStatus[]>("get_upload_status_backlog")
-      .then((backlog) => {
-        if (backlog.length === 0) return;
-        setUploadStatuses((prev) => {
-          const next = new Map<string, FileUploadStatus["status"]>();
-          for (const status of backlog) {
-            next.set(status.relative_path, status.status);
-          }
-          for (const [path, status] of prev) next.set(path, status);
-          while (next.size > 1000) {
-            const firstKey = next.keys().next().value;
-            if (firstKey === undefined) break;
-            next.delete(firstKey);
-          }
-          return next;
-        });
-      })
-      .catch((err) =>
-        console.error("Failed to load upload status backlog:", err)
-      );
-
     // Listen for file upload status events
     const unlistenUploadStatus = listen("file_upload_status", (event) => {
       console.log("file_upload_status", event);
@@ -256,6 +216,51 @@ export default function Simple() {
         return next;
       });
     });
+
+    // Events emitted before this component mounted (e.g. the initial scan of
+    // a watch resumed at startup) were dropped, so backfill from the backend's
+    // backlog. Wait for the listener registrations above to complete first, so
+    // every event is seen either live or in the snapshot; on conflicts the
+    // live entry wins.
+    Promise.all([unlistenFileChange, unlistenUploadStatus])
+      .catch(() => undefined) // backfill even if listener setup failed
+      .then(() => {
+        invoke<FileChangeEvent[]>("get_file_change_backlog")
+          .then((backlog) => {
+            if (backlog.length === 0) return;
+            setFileChanges((prev) => {
+              const seen = new Set(prev.map((change) => change.path));
+              const merged = [
+                ...prev,
+                ...backlog.filter((change) => !seen.has(change.path)),
+              ];
+              return merged.slice(0, 500);
+            });
+          })
+          .catch((err) =>
+            console.error("Failed to load file change backlog:", err)
+          );
+        invoke<FileUploadStatus[]>("get_upload_status_backlog")
+          .then((backlog) => {
+            if (backlog.length === 0) return;
+            setUploadStatuses((prev) => {
+              const next = new Map<string, FileUploadStatus["status"]>();
+              for (const status of backlog) {
+                next.set(status.relative_path, status.status);
+              }
+              for (const [path, status] of prev) next.set(path, status);
+              while (next.size > 1000) {
+                const firstKey = next.keys().next().value;
+                if (firstKey === undefined) break;
+                next.delete(firstKey);
+              }
+              return next;
+            });
+          })
+          .catch((err) =>
+            console.error("Failed to load upload status backlog:", err)
+          );
+      });
 
     return () => {
       unlistenFileChange.then((fn) => fn());

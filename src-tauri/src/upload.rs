@@ -110,7 +110,8 @@ pub type UploadProgressState = Arc<Mutex<UploadProgress>>;
 // frontend replays this backlog on mount via get_upload_status_backlog.
 pub type UploadStatusLog = Arc<Mutex<Vec<FileUploadStatus>>>;
 
-const MAX_UPLOAD_STATUS_LOG: usize = 1000;
+#[doc(hidden)]
+pub const MAX_UPLOAD_STATUS_LOG: usize = 1000;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct SessionContext {

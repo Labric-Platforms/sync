@@ -42,12 +42,15 @@ use upload::{
     clear_upload_queue, get_org_members, get_queue_size, get_session_context, get_upload_config,
     get_upload_progress, get_upload_status_backlog, process_upload_queue, restore_session_context,
     restore_upload_config, set_session_context, set_upload_config, trigger_manual_upload,
-    SessionContext, SessionContextState, UploadProgress, UploadProgressState, UploadStatusLog,
+    SessionContext, SessionContextState, UploadProgress, UploadProgressState,
     SETTINGS_STORE_FILENAME,
 };
 // Public so integration tests can drive the watch lifecycle; not a real API
 #[doc(hidden)]
-pub use upload::{UploadConfig, UploadConfigState, UploadQueue};
+pub use upload::{
+    emit_file_upload_status, FileUploadStatus, UploadConfig, UploadConfigState, UploadQueue,
+    UploadStatusLog, MAX_UPLOAD_STATUS_LOG,
+};
 
 mod heartbeat;
 use heartbeat::{
@@ -58,11 +61,12 @@ use heartbeat::{
 mod diagnostics;
 use diagnostics::run_network_diagnostics;
 
+#[doc(hidden)]
 #[derive(Clone, Serialize, Deserialize)]
-struct FileChangeEvent {
-    path: String,
-    event_type: String,
-    timestamp: u64,
+pub struct FileChangeEvent {
+    pub path: String,
+    pub event_type: String,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -93,10 +97,12 @@ pub type WatchGeneration = Arc<AtomicU64>;
 // events emitted before the webview has registered listeners (e.g. the whole
 // initial scan of a watch resumed at startup), so the frontend replays this
 // backlog on mount via get_file_change_backlog.
-type FileChangeLog = Arc<Mutex<VecDeque<FileChangeEvent>>>;
+#[doc(hidden)]
+pub type FileChangeLog = Arc<Mutex<VecDeque<FileChangeEvent>>>;
 
 // Matches the frontend's file-change list cap
-const MAX_FILE_CHANGE_LOG: usize = 500;
+#[doc(hidden)]
+pub const MAX_FILE_CHANGE_LOG: usize = 500;
 
 fn record_and_emit_file_change<R: tauri::Runtime>(
     app_handle: &AppHandle<R>,

@@ -79,7 +79,7 @@ src/                        # React frontend
       route.tsx             # Auth guard layout
       dashboard.tsx         # Main file watcher dashboard
   components/               # UI components (shadcn/ui + custom)
-  hooks/                    # useUploadManager, useHeartbeat, useAppUpdater
+  hooks/                    # useUploadManager, useHeartbeat, useAppUpdater, use-session-context
   lib/                      # Tauri store wrapper, utils
   types/                    # TypeScript type definitions
 
@@ -88,6 +88,8 @@ src-tauri/                  # Rust backend
     lib.rs                  # App setup, Tauri commands, file watcher
     upload.rs               # Upload queue processor
     heartbeat.rs            # Heartbeat service
+    diagnostics.rs          # Network diagnostics (connectivity checks)
+    http_client.rs          # Shared HTTP client + response helpers
   tauri.conf.json           # Tauri app configuration
   Cargo.toml                # Rust dependencies
 ```

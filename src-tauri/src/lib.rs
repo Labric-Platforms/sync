@@ -42,9 +42,12 @@ use upload::{
     clear_upload_queue, get_org_members, get_queue_size, get_session_context, get_upload_config,
     get_upload_progress, get_upload_status_backlog, process_upload_queue, restore_session_context,
     restore_upload_config, set_session_context, set_upload_config, trigger_manual_upload,
-    SessionContext, SessionContextState, UploadConfig, UploadConfigState, UploadProgress,
-    UploadProgressState, UploadQueue, UploadStatusLog, SETTINGS_STORE_FILENAME,
+    SessionContext, SessionContextState, UploadProgress, UploadProgressState, UploadStatusLog,
+    SETTINGS_STORE_FILENAME,
 };
+// Public so integration tests can drive the watch lifecycle; not a real API
+#[doc(hidden)]
+pub use upload::{UploadConfig, UploadConfigState, UploadQueue};
 
 mod heartbeat;
 use heartbeat::{
@@ -76,13 +79,16 @@ struct DeviceInfo {
 }
 
 // Global watcher state
-type WatcherState = Arc<Mutex<Option<RecommendedWatcher>>>;
+#[doc(hidden)]
+pub type WatcherState = Arc<Mutex<Option<RecommendedWatcher>>>;
 // Folder currently being watched, if any
-type WatchedFolderState = Arc<Mutex<Option<String>>>;
+#[doc(hidden)]
+pub type WatchedFolderState = Arc<Mutex<Option<String>>>;
 // Bumped by every start/stop request so an in-flight start (whose initial scan
 // can take a long time on big folders) can detect it was superseded and abort
 // instead of undoing a newer stop or folder change
-type WatchGeneration = Arc<AtomicU64>;
+#[doc(hidden)]
+pub type WatchGeneration = Arc<AtomicU64>;
 // Recent file-change events, oldest first, one entry per path. Tauri drops
 // events emitted before the webview has registered listeners (e.g. the whole
 // initial scan of a watch resumed at startup), so the frontend replays this
@@ -92,7 +98,10 @@ type FileChangeLog = Arc<Mutex<VecDeque<FileChangeEvent>>>;
 // Matches the frontend's file-change list cap
 const MAX_FILE_CHANGE_LOG: usize = 500;
 
-fn record_and_emit_file_change(app_handle: &AppHandle, event: &FileChangeEvent) {
+fn record_and_emit_file_change<R: tauri::Runtime>(
+    app_handle: &AppHandle<R>,
+    event: &FileChangeEvent,
+) {
     if let Some(log) = app_handle.try_state::<FileChangeLog>() {
         let mut log = log.lock();
         // Keep only the latest event per path, mirroring the frontend list
@@ -107,7 +116,9 @@ fn record_and_emit_file_change(app_handle: &AppHandle, event: &FileChangeEvent) 
 
 const WATCHED_FOLDER_STORE_KEY: &str = "watched_folder";
 
-enum WatchStartOutcome {
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum WatchStartOutcome {
     Started,
     Superseded,
 }
@@ -138,10 +149,12 @@ async fn start_watching(
     }
 }
 
+// Public (doc-hidden) so integration tests can exercise the supersede logic
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn start_watching_impl(
+pub fn start_watching_impl<R: tauri::Runtime>(
     folder_path: String,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     watcher_state: &WatcherState,
     upload_queue: &UploadQueue,
     upload_config: &UploadConfigState,
@@ -149,9 +162,15 @@ fn start_watching_impl(
     generation: &WatchGeneration,
     expected_generation: u64,
 ) -> Result<WatchStartOutcome, String> {
-    // Stop any existing watcher
+    let is_superseded = || generation.load(Ordering::SeqCst) != expected_generation;
+
+    // Stop any existing watcher — checked under the lock so a stale start can
+    // never tear down a watcher that a newer request has already installed
     {
         let mut watcher = watcher_state.lock();
+        if is_superseded() {
+            return Ok(WatchStartOutcome::Superseded);
+        }
         *watcher = None;
     }
 
@@ -161,8 +180,17 @@ fn start_watching_impl(
         log.lock().clear();
     }
 
-    // First, capture initial folder contents and optionally queue for upload
-    capture_initial_contents(&folder_path, app_handle, upload_queue, upload_config)?;
+    // Scan the folder without touching the upload queue. Enqueueing is
+    // deferred until after the commit point below, so a start that is
+    // superseded mid-scan (the user stopped or picked another folder) leaves
+    // no uploads behind.
+    let files = match scan_folder_contents(&folder_path, app_handle, &is_superseded)? {
+        Some(files) => files,
+        None => {
+            log::info!("Initial scan of {folder_path} superseded before it finished; discarding");
+            return Ok(WatchStartOutcome::Superseded);
+        }
+    };
 
     let app_handle_clone = app_handle.clone();
     let upload_queue_clone = upload_queue.clone();
@@ -178,8 +206,17 @@ fn start_watching_impl(
         let queue = upload_queue_clone.clone();
         let config = upload_config_clone.clone();
         let app = app_handle.clone();
+        let generation = generation.clone();
         tauri::async_runtime::spawn(async move {
             while let Some((file_path, base_path)) = watcher_rx.recv().await {
+                // Watcher events can race in around a stop or a newer start
+                // (the watcher briefly runs before the commit check below, and
+                // channel events may still be in flight when it is dropped).
+                // Once this watch is no longer the newest request, drop them
+                // instead of queueing uploads for a folder the user left.
+                if generation.load(Ordering::SeqCst) != expected_generation {
+                    break;
+                }
                 add_to_upload_queue_sync(file_path, base_path, &queue, &config, &app);
             }
         });
@@ -237,7 +274,7 @@ fn start_watching_impl(
     // otherwise a slow scan would silently undo the user's later action.
     {
         let mut watcher_guard = watcher_state.lock();
-        if generation.load(Ordering::SeqCst) != expected_generation {
+        if is_superseded() {
             log::info!("Watch start for {folder_path} was superseded before it finished; discarding");
             return Ok(WatchStartOutcome::Superseded);
         }
@@ -248,15 +285,33 @@ fn start_watching_impl(
         }
     }
 
+    // The watch is committed; now queue the scanned files for upload. A stop
+    // or newer start arriving mid-enqueue aborts the remainder, the same way
+    // it would have aborted the scan.
+    enqueue_scanned_files(
+        files,
+        &folder_path,
+        upload_queue,
+        upload_config,
+        app_handle,
+        &is_superseded,
+    );
+
     Ok(WatchStartOutcome::Started)
 }
 
-fn capture_initial_contents(
+/// Walk the folder depth-first, emitting `file_change` events for the UI, and
+/// collect the files found — without queueing anything for upload yet, so an
+/// aborted start has no upload side effects. Returns `Ok(None)` if a newer
+/// start/stop request arrived mid-walk (checked per entry, so a stop during a
+/// large scan takes effect almost immediately).
+#[doc(hidden)]
+pub fn scan_folder_contents<R: tauri::Runtime>(
     folder_path: &str,
-    app_handle: &AppHandle,
-    upload_queue: &UploadQueue,
-    upload_config: &UploadConfigState,
-) -> Result<(), String> {
+    app_handle: &AppHandle<R>,
+    is_superseded: &impl Fn() -> bool,
+) -> Result<Option<Vec<String>>, String> {
+    let mut files = Vec::new();
     let mut dirs_to_visit = vec![PathBuf::from(folder_path)];
 
     while let Some(dir) = dirs_to_visit.pop() {
@@ -264,6 +319,9 @@ fn capture_initial_contents(
             fs::read_dir(&dir).map_err(|e| format!("Failed to read directory {dir:?}: {e}"))?;
 
         for entry in entries.flatten() {
+            if is_superseded() {
+                return Ok(None);
+            }
             let path = entry.path();
             let file_change = FileChangeEvent {
                 path: path.to_string_lossy().to_string(),
@@ -280,19 +338,43 @@ fn capture_initial_contents(
                 upload::emit_file_upload_status(&relative_path, upload::STATUS_DIRECTORY, None, app_handle);
                 dirs_to_visit.push(path);
             } else {
-                add_to_upload_queue_with_event_type(
-                    path.to_string_lossy().to_string(),
-                    folder_path.to_string(),
-                    upload_queue,
-                    upload_config,
-                    EVENT_TYPE_INITIAL,
-                    app_handle,
-                );
+                files.push(path.to_string_lossy().to_string());
             }
         }
     }
 
-    Ok(())
+    Ok(Some(files))
+}
+
+/// Queue the files collected by the initial scan, aborting the remainder if a
+/// newer start/stop request arrives mid-way.
+#[doc(hidden)]
+pub fn enqueue_scanned_files<R: tauri::Runtime>(
+    files: Vec<String>,
+    folder_path: &str,
+    upload_queue: &UploadQueue,
+    upload_config: &UploadConfigState,
+    app_handle: &AppHandle<R>,
+    is_superseded: &impl Fn() -> bool,
+) {
+    let total = files.len();
+    for (queued, file) in files.into_iter().enumerate() {
+        if is_superseded() {
+            log::info!(
+                "Watch of {folder_path} superseded; skipped queueing {} of {total} scanned files",
+                total - queued
+            );
+            return;
+        }
+        add_to_upload_queue_with_event_type(
+            file,
+            folder_path.to_string(),
+            upload_queue,
+            upload_config,
+            EVENT_TYPE_INITIAL,
+            app_handle,
+        );
+    }
 }
 
 #[tauri::command]

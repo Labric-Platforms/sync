@@ -40,10 +40,10 @@ use tauri_plugin_store::StoreExt;
 use upload::{
     add_to_upload_queue_sync, add_to_upload_queue_with_event_type, clear_session_context,
     clear_upload_queue, get_org_members, get_queue_size, get_session_context, get_upload_config,
-    get_upload_progress, process_upload_queue, restore_session_context, restore_upload_config,
-    set_session_context, set_upload_config, trigger_manual_upload, SessionContext,
-    SessionContextState, UploadConfig, UploadConfigState, UploadProgress, UploadProgressState,
-    UploadQueue, SETTINGS_STORE_FILENAME,
+    get_upload_progress, get_upload_status_backlog, process_upload_queue, restore_session_context,
+    restore_upload_config, set_session_context, set_upload_config, trigger_manual_upload,
+    SessionContext, SessionContextState, UploadConfig, UploadConfigState, UploadProgress,
+    UploadProgressState, UploadQueue, UploadStatusLog, SETTINGS_STORE_FILENAME,
 };
 
 mod heartbeat;
@@ -83,6 +83,27 @@ type WatchedFolderState = Arc<Mutex<Option<String>>>;
 // can take a long time on big folders) can detect it was superseded and abort
 // instead of undoing a newer stop or folder change
 type WatchGeneration = Arc<AtomicU64>;
+// Recent file-change events, oldest first, one entry per path. Tauri drops
+// events emitted before the webview has registered listeners (e.g. the whole
+// initial scan of a watch resumed at startup), so the frontend replays this
+// backlog on mount via get_file_change_backlog.
+type FileChangeLog = Arc<Mutex<VecDeque<FileChangeEvent>>>;
+
+// Matches the frontend's file-change list cap
+const MAX_FILE_CHANGE_LOG: usize = 500;
+
+fn record_and_emit_file_change(app_handle: &AppHandle, event: &FileChangeEvent) {
+    if let Some(log) = app_handle.try_state::<FileChangeLog>() {
+        let mut log = log.lock();
+        // Keep only the latest event per path, mirroring the frontend list
+        log.retain(|e| e.path != event.path);
+        if log.len() >= MAX_FILE_CHANGE_LOG {
+            log.pop_front();
+        }
+        log.push_back(event.clone());
+    }
+    let _ = app_handle.emit("file_change", event);
+}
 
 const WATCHED_FOLDER_STORE_KEY: &str = "watched_folder";
 
@@ -132,6 +153,12 @@ fn start_watching_impl(
     {
         let mut watcher = watcher_state.lock();
         *watcher = None;
+    }
+
+    // Drop backlog entries from any previously watched folder, matching the
+    // frontend clearing its list when the watched folder changes
+    if let Some(log) = app_handle.try_state::<FileChangeLog>() {
+        log.lock().clear();
     }
 
     // First, capture initial folder contents and optionally queue for upload
@@ -187,7 +214,7 @@ fn start_watching_impl(
             };
 
             // Send to frontend immediately — never blocked by queue locks
-            let _ = app_handle_clone.emit("file_change", &file_change);
+            record_and_emit_file_change(&app_handle_clone, &file_change);
 
             // Queue for upload via channel (non-blocking send)
             if event_type == EVENT_TYPE_CREATED || event_type == EVENT_TYPE_MODIFIED {
@@ -246,7 +273,7 @@ fn capture_initial_contents(
                     .unwrap()
                     .as_secs(),
             };
-            let _ = app_handle.emit("file_change", &file_change);
+            record_and_emit_file_change(app_handle, &file_change);
 
             if path.is_dir() {
                 let relative_path = upload::get_relative_path(&path.to_string_lossy(), folder_path);
@@ -284,6 +311,11 @@ async fn stop_watching(
     }
     *watched_folder.lock() = None;
 
+    // Match the frontend, which clears its file list on stop
+    if let Some(log) = app_handle.try_state::<FileChangeLog>() {
+        log.lock().clear();
+    }
+
     // The user explicitly stopped watching, so don't resume on next launch
     if let Ok(store) = app_handle.store(SETTINGS_STORE_FILENAME) {
         let _ = store.delete(WATCHED_FOLDER_STORE_KEY);
@@ -297,6 +329,14 @@ fn get_watched_folder(
     watched_folder: tauri::State<'_, WatchedFolderState>,
 ) -> Result<Option<String>, String> {
     Ok(watched_folder.lock().clone())
+}
+
+#[tauri::command]
+fn get_file_change_backlog(
+    log: tauri::State<'_, FileChangeLog>,
+) -> Result<Vec<FileChangeEvent>, String> {
+    // Newest first, matching the frontend's display order
+    Ok(log.lock().iter().rev().cloned().collect())
 }
 
 fn get_device_id_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -487,6 +527,8 @@ pub fn run() {
     let watcher_state: WatcherState = Arc::new(Mutex::new(None));
     let watched_folder_state: WatchedFolderState = Arc::new(Mutex::new(None));
     let watch_generation: WatchGeneration = Arc::new(AtomicU64::new(0));
+    let file_change_log: FileChangeLog = Arc::new(Mutex::new(VecDeque::new()));
+    let upload_status_log: UploadStatusLog = Arc::new(Mutex::new(Vec::new()));
     let upload_queue: UploadQueue = Arc::new(Mutex::new(VecDeque::new()));
     let upload_config: UploadConfigState = Arc::new(Mutex::new(UploadConfig::default()));
     let upload_progress: UploadProgressState = Arc::new(Mutex::new(UploadProgress {
@@ -537,6 +579,8 @@ pub fn run() {
         .manage(watcher_state.clone())
         .manage(watched_folder_state.clone())
         .manage(watch_generation.clone())
+        .manage(file_change_log.clone())
+        .manage(upload_status_log.clone())
         .manage(http_client.clone())
         .manage(upload_queue.clone())
         .manage(upload_config.clone())
@@ -549,6 +593,8 @@ pub fn run() {
             start_watching,
             stop_watching,
             get_watched_folder,
+            get_file_change_backlog,
+            get_upload_status_backlog,
             get_device_info,
             get_upload_config,
             set_upload_config,

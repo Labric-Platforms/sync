@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
@@ -104,6 +104,13 @@ pub struct FileUploadStatus {
 pub type UploadQueue = Arc<Mutex<VecDeque<UploadItem>>>;
 pub type UploadConfigState = Arc<Mutex<UploadConfig>>;
 pub type UploadProgressState = Arc<Mutex<UploadProgress>>;
+// Latest status per relative path, in first-seen order so the oldest entries
+// can be evicted. Events emitted before the webview loads (e.g. during the
+// initial scan of a watch resumed at startup) are dropped by Tauri, so the
+// frontend replays this backlog on mount via get_upload_status_backlog.
+pub type UploadStatusLog = Arc<Mutex<Vec<FileUploadStatus>>>;
+
+const MAX_UPLOAD_STATUS_LOG: usize = 1000;
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct SessionContext {
@@ -200,9 +207,29 @@ pub fn emit_file_upload_status(
         status: status.to_string(),
         error,
     };
+    // Record before emitting so a frontend mounting concurrently sees the
+    // status either live or in the backlog, never neither
+    if let Some(log) = app_handle.try_state::<UploadStatusLog>() {
+        let mut log = log.lock();
+        if let Some(existing) = log.iter_mut().find(|s| s.relative_path == relative_path) {
+            *existing = upload_status.clone();
+        } else {
+            if log.len() >= MAX_UPLOAD_STATUS_LOG {
+                log.remove(0);
+            }
+            log.push(upload_status.clone());
+        }
+    }
     if let Err(e) = app_handle.emit("file_upload_status", &upload_status) {
         warn!("Failed to emit file upload status event: {e}");
     }
+}
+
+#[tauri::command]
+pub fn get_upload_status_backlog(
+    log: tauri::State<'_, UploadStatusLog>,
+) -> Result<Vec<FileUploadStatus>, String> {
+    Ok(log.lock().clone())
 }
 
 pub fn should_ignore_file(file_path: &str, ignored_patterns: &[String]) -> bool {

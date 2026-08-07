@@ -49,6 +49,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml   # Lint Rust code
 
 ## CI/CD
 
+- Every new PR must bump the version (patch bump unless told otherwise) in all three places: `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`
 - GitHub Actions on push to `main` builds for macOS (x86_64 + aarch64), Linux, Windows
 - Builds are code-signed (Apple notarization + DigiCert for Windows)
 - Auto-updates via Tauri updater plugin pulling from GitHub Releases

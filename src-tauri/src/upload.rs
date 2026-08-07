@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
@@ -189,11 +189,11 @@ struct PreparedUpload {
 
 // ── Small helpers ───────────────────────────────────────────────────────
 
-pub fn emit_file_upload_status(
+pub fn emit_file_upload_status<R: Runtime>(
     relative_path: &str,
     status: &str,
     error: Option<String>,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
 ) {
     let upload_status = FileUploadStatus {
         relative_path: relative_path.to_string(),
@@ -273,12 +273,12 @@ fn get_auth_token(app_handle: &AppHandle) -> Result<Option<String>, String> {
 
 // ── Queue management ────────────────────────────────────────────────────
 
-pub fn add_to_upload_queue_sync(
+pub fn add_to_upload_queue_sync<R: Runtime>(
     file_path: String,
     base_path: String,
     upload_queue: &UploadQueue,
     upload_config: &UploadConfigState,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
 ) {
     add_to_upload_queue_with_event_type(
         file_path,
@@ -290,13 +290,13 @@ pub fn add_to_upload_queue_sync(
     );
 }
 
-pub fn add_to_upload_queue_with_event_type(
+pub fn add_to_upload_queue_with_event_type<R: Runtime>(
     file_path: String,
     base_path: String,
     upload_queue: &UploadQueue,
     upload_config: &UploadConfigState,
     event_type: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
 ) {
     let config = upload_config.lock().clone();
     let relative_path = get_relative_path(&file_path, &base_path);

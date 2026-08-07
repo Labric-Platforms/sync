@@ -217,6 +217,51 @@ export default function Simple() {
       });
     });
 
+    // Events emitted before this component mounted (e.g. the initial scan of
+    // a watch resumed at startup) were dropped, so backfill from the backend's
+    // backlog. Wait for the listener registrations above to complete first, so
+    // every event is seen either live or in the snapshot; on conflicts the
+    // live entry wins.
+    Promise.all([unlistenFileChange, unlistenUploadStatus])
+      .catch(() => undefined) // backfill even if listener setup failed
+      .then(() => {
+        invoke<FileChangeEvent[]>("get_file_change_backlog")
+          .then((backlog) => {
+            if (backlog.length === 0) return;
+            setFileChanges((prev) => {
+              const seen = new Set(prev.map((change) => change.path));
+              const merged = [
+                ...prev,
+                ...backlog.filter((change) => !seen.has(change.path)),
+              ];
+              return merged.slice(0, 500);
+            });
+          })
+          .catch((err) =>
+            console.error("Failed to load file change backlog:", err)
+          );
+        invoke<FileUploadStatus[]>("get_upload_status_backlog")
+          .then((backlog) => {
+            if (backlog.length === 0) return;
+            setUploadStatuses((prev) => {
+              const next = new Map<string, FileUploadStatus["status"]>();
+              for (const status of backlog) {
+                next.set(status.relative_path, status.status);
+              }
+              for (const [path, status] of prev) next.set(path, status);
+              while (next.size > 1000) {
+                const firstKey = next.keys().next().value;
+                if (firstKey === undefined) break;
+                next.delete(firstKey);
+              }
+              return next;
+            });
+          })
+          .catch((err) =>
+            console.error("Failed to load upload status backlog:", err)
+          );
+      });
+
     return () => {
       unlistenFileChange.then((fn) => fn());
       unlistenHeartbeat.then((fn) => fn());
